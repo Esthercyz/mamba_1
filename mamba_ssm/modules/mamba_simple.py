@@ -31,53 +31,54 @@ except ImportError:
 class Mamba(nn.Module):
     def __init__(
         self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        dt_min=0.001,
-        dt_max=0.1,
+        d_model, # 模型特征维度/每个token的特征向量分量数/通道数/mamba模块的输入输出维度，维度越大每个Token能表达的信息越丰富，通常取512、768、1024等
+        d_state=16, # SSM内部状态维度h_t，控制SSM的记忆容量和表达能力，较大的d_state能捕捉更复杂的序列模式，但计算开销也更大，通常取16、32等
+        d_conv=4, # 卷积核大小（控制因果卷积的滑动窗口大小），控制局部特征提取的范围
+        expand=2, # 特征维度扩展因子，self.d_inner = int(self.expand * self.d_model)
+        dt_rank="auto", # dt的低秩表示维度，默认是d_model/16，由输入特征动态生成，先生成低维dt表示，再通过线性映射恢复到d_inner维度
+        dt_min=0.001, # dt的最小值，越小状态更新越慢
+        dt_max=0.1, # dt的最大值，越大状态更新越慢
         dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        conv_bias=True,
-        bias=False,
-        use_fast_path=True,  # Fused kernel options
-        layer_idx=None,
+        dt_scale=1.0, # 控制dt初始化的波动范围
+        dt_init_floor=1e-4, # dt初始化下限，防止dt无限接近0，避免模型一开始就完全遗忘
+        ### 选择性SSM核心：输入不同，dt不同，模型的记忆/遗忘策略不同，dt = Softplus(Linear(x)+bias)
+        conv_bias=True, # 卷积层是否加偏置向量，如果加会使卷积对序列特征的局部提取更灵活
+        bias=False, # 线性层是否加偏置 Mamba 的内部特征维度已经通过expand扩大，且有卷积、SSM 的非线性变换，不加偏置也能保证拟合能力，同时减少参数数量，提升训练 / 推理速度；这是作者实验后的最优选择。
+        use_fast_path=True,  # Fused kernel options 调用mamba_inner_fn—— 这是一个融合了「卷积 + SSM + 投影」的 CUDA 内核，把多个步骤合并成一个，大幅提升训练 / 推理速度；
+        layer_idx=None, # 用于多层mamba堆叠时，在inference cache中区分不同层的状态
         device=None,
         dtype=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
+        self.d_model = d_model # 输入/输出维度
+        self.d_state = d_state # SSM内部状态维度（B、C矩阵）
+        self.d_conv = d_conv 
+        self.expand = expand # 扩展因子，d_inner = expand×d_model，让中间层有更多参数学习特征；
         self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank # dt 的低维表示维度（默认是 d_model/16），平衡计算量和表达能力。
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
-
+        # 输入维度映射为扩展维度，拆成两个分支：特征提取和门控（筛选有用特征）
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
         self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=self.d_inner,
-            padding=d_conv - 1,
+            in_channels=self.d_inner, # 卷积的输入输出维度都是d_inner=expand×d_model
+            out_channels=self.d_inner, # 卷积的输入输出维度都是d_inner=expand×d_model
+            bias=conv_bias, # 卷积层是否加偏置
+            kernel_size=d_conv, # 卷积核大小
+            groups=self.d_inner, # 深度可分离卷积，每个通道独立卷积
+            padding=d_conv - 1, # 因为是因果卷积，padding放在左侧，保证输出长度和输入长度一致
             **factory_kwargs,
-        )
+        ) # 深度可分离卷积，逐通道卷积提取局部特征
 
-        self.activation = "silu"
-        self.act = nn.SiLU()
+        self.activation = "silu" # 非线性激活函数
+        self.act = nn.SiLU() 
 
-        self.x_proj = nn.Linear(
+        self.x_proj = nn.Linear( # 将卷积输出映射为dt，B，C三个部分，dt是状态更新速度，B是输入->状态投影，C是状态->输出投影，用于后续的SSM计算
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)  # dt的线性映射，dt_rank维度的低秩表示映射到d_inner维度
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
