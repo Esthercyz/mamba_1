@@ -27,11 +27,11 @@ except ImportError:
 
 
 def create_block(
-    d_model,
-    d_intermediate,
-    ssm_cfg=None,
-    attn_layer_idx=None,
-    attn_cfg=None,
+    d_model, # Token embedding维度
+    d_intermediate, # mlp中间层维度，0表示禁用
+    ssm_cfg=None, # Mamba模块配置（如d_state,d_conv）等
+    attn_layer_idx=None,# 需要插入注意力层（MHA）的层索引列表（其余用Mamba）
+    attn_cfg=None, # 是否使用RMSNorm代替LayerNorm（更高效)
     norm_epsilon=1e-5,
     rms_norm=False,
     residual_in_fp32=False,
@@ -47,7 +47,7 @@ def create_block(
     if attn_cfg is None:
         attn_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
-    if layer_idx not in attn_layer_idx:
+    if layer_idx not in attn_layer_idx: # 如果当前层不再attn_layer_idx中，创建Mamba模块
         # Create a copy of the config to modify
         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
@@ -59,17 +59,19 @@ def create_block(
             **ssm_cfg,
             **factory_kwargs
         )
-    else:
+    else: # 创建多头注意力层
         mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, **factory_kwargs)
+    # 归一化层 partial函数固定Mamba多头注意力MHA的参数（如layer_idx、device），简化实例化
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
+    # MLP层
     if d_intermediate == 0:
         mlp_cls = nn.Identity
     else:
         mlp_cls = partial(
             GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory_kwargs
-        )
+        ) # 组装成Block的基础功能单元
     block = Block(
         d_model,
         mixer_cls,
@@ -83,10 +85,10 @@ def create_block(
 
 
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
-def _init_weights(
+def _init_weights(　# 标准化模型权重初始化
     module,
     n_layer,
-    initializer_range=0.02,  # Now only used for embedding layer.
+    initializer_range=0.02,  # Now only used for embedding layer. 嵌入层正态分布初始化
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
@@ -104,6 +106,7 @@ def _init_weights(
         #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
         #
         # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
+        # 对Mamba输出投影、MLP输出投影权重进行缩放初始化
         for name, p in module.named_parameters():
             if name in ["out_proj.weight", "fc2.weight"]:
                 # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
@@ -136,7 +139,7 @@ class MixerModel(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
-
+        # Token embedding模块：将Token ID映射为d_model维向量
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
 
         # We change the order of residual and layer norm:
@@ -148,7 +151,7 @@ class MixerModel(nn.Module):
         if self.fused_add_norm:
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
-
+        # 堆叠n_layer个基础块（Mamba/注意力混合)
         self.layers = nn.ModuleList(
             [
                 create_block(
@@ -167,7 +170,7 @@ class MixerModel(nn.Module):
                 for i in range(n_layer)
             ]
         )
-
+        # 最终归一化层（LayerNorm/RMSNorm）
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
@@ -181,21 +184,26 @@ class MixerModel(nn.Module):
             )
         )
 
+    # 为每一层Block分配推理缓存，避免重复创建张量，降低延迟
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
             i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
             for i, layer in enumerate(self.layers)
         }
 
+    # 输入：input_ids(Token ID张量，形状（B，L），B=批次，L=序列长度）)
+    # 输出：加工后的高维特征（形状（B，L，D），D=d_model）
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)
+        hidden_states = self.embedding(input_ids) # Token ID->嵌入向量（B，L，D）
         residual = None
         for layer in self.layers:
+            # 逐层加工：每个Block接收特征+残差，返回新特征+更新后残差
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+        # 最终归一化（兼容融合/非融合模式)
         if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
+            residual = (hidden_states + residual) if residual is not None else hidden_states # 残差变量，贯穿所有层，实现残差连接，避免梯度消失
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             # Set prenorm=False here since we don't need the residual
@@ -238,7 +246,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         super().__init__()
         if vocab_size % pad_vocab_size_multiple != 0:
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
-        self.backbone = MixerModel(
+        self.backbone = MixerModel( # 加载骨干网络（含Token Embedding和特征加工）
             d_model=d_model,
             n_layer=n_layer,
             d_intermediate=d_intermediate,
@@ -246,12 +254,13 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             ssm_cfg=ssm_cfg,
             attn_layer_idx=attn_layer_idx,
             attn_cfg=attn_cfg,
-            rms_norm=rms_norm,
+            rms_norm=rms_nrm,
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
             **factory_kwargs,
         )
+        # 加载语言模型头，将（B，L，D）特征映射回（B，L，Vocab_size)，输出每个Token的预测概率
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
@@ -262,7 +271,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
-        self.tie_weights()
+        self.tie_weights() # 权重共享（lm_head与backbone.embedding.weight）共享，减少参数数量，提升训练效率
 
     def tie_weights(self):
         if self.config.tie_embeddings:
@@ -272,7 +281,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
     def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
-        """
+        """ 把input_ids（Token ID序列）传入backbone，得到隐藏状态后通过lm_head映射为logits（Token预测概率），用于后续采样生成文本）
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
@@ -283,14 +292,14 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
-    @classmethod
+    @classmethod # 从huggingface hub加载预训练模型(配置+权重)
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
         model = cls(config, device=device, dtype=dtype, **kwargs)
         model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
         return model
-
+    # 保存模型配置和权重
     def save_pretrained(self, save_directory):
         """
         Minimal implementation of save_pretrained for MambaLMHeadModel.
