@@ -110,6 +110,75 @@ This is an example of how to integrate Mamba into an end-to-end neural network.
 This example is used in the generation scripts below.
 
 
+## Offline Reinforcement Learning with Decision Mamba
+
+The repository now includes an offline reinforcement learning (RL) stack that uses a
+Decision Mamba actor together with a twin-critic Conservative Q-Learning (CQL) trainer.
+The implementation lives in [`mamba_ssm/rl`](mamba_ssm/rl) and exposes the following
+public API:
+
+- `DecisionMambaActor`: embeds `(return-to-go, state [, previous action])` sequences and
+  produces policy logits.
+- `TwinQCritic`: twin critic ensemble for value estimation.
+- `DecisionMambaCQLTrainer`: offline trainer implementing Bellman regression + CQL and
+  delayed policy updates.
+- `OfflineDecisionDataset`: helper to convert trajectory datasets into Decision Mamba
+  training batches.
+
+Example usage from Python:
+
+```python
+import torch
+from mamba_ssm.rl import (
+    DecisionMambaActor,
+    DecisionMambaCQLTrainer,
+    DecisionMambaConfig,
+    DecisionTrajectory,
+    OfflineDecisionDataset,
+    TrainerConfig,
+    TwinQCritic,
+)
+
+# Build a tiny synthetic dataset -------------------------------------------------
+trajectories = []
+for _ in range(8):
+    states = torch.randn(4, 8)
+    actions = torch.randint(0, 5, (4,))
+    rewards = torch.randn(4)
+    trajectories.append(DecisionTrajectory(states=states, actions=actions, rewards=rewards))
+dataset = OfflineDecisionDataset(trajectories, context_len=3, gamma=0.95)
+
+# Instantiate actor / critics -----------------------------------------------------
+actor_cfg = DecisionMambaConfig(
+    state_dim=dataset.state_dimension,
+    action_dim=dataset.num_actions,
+    max_seq_len=dataset.context_len,
+)
+actor = DecisionMambaActor(actor_cfg)
+critic = TwinQCritic(state_dim=dataset.state_dimension, action_dim=dataset.num_actions)
+trainer = DecisionMambaCQLTrainer(actor, critic, TrainerConfig(device="cpu"))
+
+# One optimisation step ----------------------------------------------------------
+batch = OfflineDecisionDataset.collate_fn([dataset[0], dataset[1]])
+metrics = trainer.step(batch)
+print(metrics)
+```
+
+An end-to-end training entry-point is available at
+`examples/train_decision_mamba.py`. It accepts either a Torch-saved dataset or
+falls back to synthetic data for smoke testing:
+
+```bash
+python examples/train_decision_mamba.py --epochs 5 --batch-size 128 --context-len 3
+```
+
+The expected dataset format is a Torch file containing a list (or dict with key
+`trajectories`) of items with `states`, `actions`, `rewards`, and optional `rtg`
+entries. Each entry is converted into sequences of `(RTG, state, action)` tokens as
+described in the accompanying paper, defaulting to immediate rewards for the
+single-step scenario when RTGs are omitted.
+
+
 ## Pretrained Models
 
 Pretrained models are uploaded to

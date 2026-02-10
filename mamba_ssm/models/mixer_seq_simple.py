@@ -85,7 +85,7 @@ def create_block(
 
 
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
-def _init_weights(　# 标准化模型权重初始化
+def _init_weights(
     module,
     n_layer,
     initializer_range=0.02,  # Now only used for embedding layer. 嵌入层正态分布初始化
