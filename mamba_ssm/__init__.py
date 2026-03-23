@@ -16,15 +16,13 @@ try:
 except ImportError:  # pragma: no cover
     Mamba2 = None  # type: ignore[assignment]
 
-try:
-    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-except ImportError:  # pragma: no cover
-    MambaLMHeadModel = None  # type: ignore[assignment]
+# NOTE: Avoid importing model wrappers (and their optional HF/transformers deps)
+# at package import time. They are not needed for this repo's training code.
+MambaLMHeadModel = None  # type: ignore[assignment]
 
 __all__ = [
     "Mamba",
     "Mamba2",
-    "MambaLMHeadModel",
     "mamba_inner_fn",
     "selective_scan_fn",
 ]

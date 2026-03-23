@@ -17,7 +17,10 @@ except ImportError:
 
 from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
 
-import selective_scan_cuda
+try:
+    import selective_scan_cuda  # type: ignore
+except Exception:  # pragma: no cover
+    selective_scan_cuda = None  # type: ignore
 
 
 class SelectiveScanFn(torch.autograd.Function):
@@ -25,6 +28,11 @@ class SelectiveScanFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                 return_last_state=False):
+        if selective_scan_cuda is None:
+            raise ModuleNotFoundError(
+                "selective_scan_cuda is not available (CUDA extension not built). "
+                "Install/build mamba_ssm to enable the fast CUDA kernel, or use selective_scan_ref fallback."
+            )
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -57,6 +65,11 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if selective_scan_cuda is None:
+            raise ModuleNotFoundError(
+                "selective_scan_cuda is not available (CUDA extension not built). "
+                "The CUDA autograd kernel cannot run."
+            )
         if not ctx.has_z:
             u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
             z = None
@@ -109,7 +122,29 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
+    if selective_scan_cuda is None:
+        return selective_scan_ref(
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D=D,
+            z=z,
+            delta_bias=delta_bias,
+            delta_softplus=delta_softplus,
+            return_last_state=return_last_state,
+        )
     return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+
+
+def mamba_inner_fn(*args, **kwargs):
+    """Fast fused path (CUDA). Not available without building CUDA extensions."""
+
+    raise ModuleNotFoundError(
+        "mamba_inner_fn requires CUDA extensions (selective_scan_cuda and causal_conv1d). "
+        "They are not built/available in this environment."
+    )
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
